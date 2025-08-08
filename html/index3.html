@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>分片上传功能 - 方案3</title>
+    <script src="https://cdn.jsdelivr.net/npm/vue@2.6.14/dist/vue.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <div class="container">
+            <div class="header">
+                <h1>🚀 片上传系统 - 方案3</h1>
+                <p>客户端直接对接MinIO，服务器仅提供预签名</p>
+            </div>
+
+            <div class="content">
+                <!-- 文件上传区域 -->
+                <div class="upload-area" 
+                     @click="selectFile" 
+                     @dragover.prevent="handleDragOver" 
+                     @dragleave.prevent="handleDragLeave"
+                     @drop.prevent="handleDrop"
+                     :class="{ dragover: isDragOver }">
+                    <div class="upload-icon">📁</div>
+                    <h3>点击选择文件或拖拽文件到此处</h3>
+                    <p>支持任意格式文件，自动分片上传</p>
+                    <input type="file" ref="fileInput" class="file-input" @change="onFileSelected">
+                </div>
+
+                <!-- 文件信息显示 -->
+                <div v-if="selectedFile" class="file-info">
+                    <h4>📄 文件信息</h4>
+                    <p><strong>文件名:</strong> {{ selectedFile.name }}</p>
+                    <p><strong>文件大小:</strong> {{ formatFileSize(selectedFile.size) }}</p>
+                    <p><strong>分片数量:</strong> {{ totalChunks }} 个</p>
+                    <p><strong>分片大小:</strong> {{ formatFileSize(chunkSize) }}</p>
+                </div>
+
+                <!-- 上传按钮 -->
+                <div v-if="selectedFile && !isUploading" style="text-align: center;">
+                    <button class="btn" @click="startUpload" :disabled="!selectedFile">
+                        🚀 开始上传
+                    </button>
+                </div>
+
+                <!-- 上传进度 -->
+                <div v-if="isUploading" class="progress-container">
+                    <h4>📊 上传进度</h4>
+                    <div class="progress-bar">
+                        <div class="progress-fill" :style="{ width: overallProgress + '%' }"></div>
+                    </div>
+                    <p>总体进度: {{ overallProgress.toFixed(1) }}% ({{ uploadedChunks }}/{{ totalChunks }})</p>
+                    
+                    <!-- 当前分片进度 -->
+                    <div v-if="currentChunk" class="chunk-progress">
+                        <p>正在上传分片 {{ currentChunk.partNumber }}/{{ totalChunks }}</p>
+                        <div class="progress-bar">
+                            <div class="progress-fill" :style="{ width: currentChunkProgress + '%' }"></div>
+                        </div>
+                        <p>分片进度: {{ currentChunkProgress.toFixed(1) }}%</p>
+                    </div>
+                </div>
+
+                <!-- 上传状态 -->
+                <div v-if="uploadStatus" class="file-info">
+                    <h4>📋 上传状态</h4>
+                    <p :class="'status ' + uploadStatus.type">{{ uploadStatus.message }}</p>
+                </div>
+
+                <!-- [新代码ai生产] 下载链接显示区域 -->
+                <div v-if="downloadInfo" class="download-info">
+                    <h4>📥 下载链接</h4>
+                    <div class="download-item">
+                        <p><strong>文件名:</strong> {{ downloadInfo.fileName }}</p>
+                        <p><strong>文件大小:</strong> {{ formatFileSize(downloadInfo.fileSize) }}</p>
+                        <div class="download-url-container">
+                            <p><strong>下载链接:</strong></p>
+                            <div class="url-display">
+                                <input type="text" :value="downloadInfo.downloadUrl" readonly class="url-input">
+                                <button class="btn copy-btn" @click="copyDownloadUrl">
+                                    📋 复制链接
+                                </button>
+                            </div>
+                        </div>
+                        <div class="download-actions">
+                            <button class="btn download-btn" @click="downloadFile">
+                                📥 直接下载
+                            </button>
+                            <a :href="downloadInfo.downloadUrl" target="_blank" class="btn open-btn">
+                                🔗 新窗口打开
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        new Vue({
+            el: '#app',
+            data: {
+                selectedFile: null,
+                isUploading: false,
+                isDragOver: false,
+                uploadId: null,
+                objectName: null,
+                totalChunks: 0,
+                chunkSize: 5 * 1024 * 1024, // 5MB分片
+                uploadedChunks: 0,
+                overallProgress: 0,
+                currentChunk: null,
+                currentChunkProgress: 0,
+                uploadStatus: null,
+                presignedUrls: [],
+                mergePresignedUrl: null,
+                uploadedChunksData: [], // 存储已上传的分片数据
+                downloadInfo: null // [新代码ai生产] 存储下载信息
+            },
+            methods: {
+                // 选择文件
+                selectFile() {
+                    this.$refs.fileInput.click();
+                },
+
+                // 文件选择处理
+                onFileSelected(event) {
+                    const file = event.target.files[0];
+                    if (file) {
+                        this.selectedFile = file;
+                        this.totalChunks = Math.ceil(file.size / this.chunkSize);
+                        this.resetUploadState();
+                    }
+                },
+
+                // 拖拽处理
+                handleDragOver(event) {
+                    this.isDragOver = true;
+                },
+
+                handleDragLeave(event) {
+                    this.isDragOver = false;
+                },
+
+                handleDrop(event) {
+                    this.isDragOver = false;
+                    const files = event.dataTransfer.files;
+                    if (files.length > 0) {
+                        this.selectedFile = files[0];
+                        this.totalChunks = Math.ceil(files[0].size / this.chunkSize);
+                        this.resetUploadState();
+                    }
+                },
+
+                // 重置上传状态
+                resetUploadState() {
+                    this.isUploading = false;
+                    this.uploadedChunks = 0;
+                    this.overallProgress = 0;
+                    this.currentChunk = null;
+                    this.currentChunkProgress = 0;
+                    this.uploadStatus = null;
+                    this.uploadedChunksData = [];
+                },
+
+                // [新代码ai生产] 获取下载链接
+                async getDownloadUrl(fileName) {
+                    try {
+                        const response = await axios.get(`http://localhost:3003/api/download/${encodeURIComponent(fileName)}`);
+                        return response.data.downloadUrl;
+                    } catch (error) {
+                        console.error('获取下载链接失败:', error);
+                        throw error;
+                    }
+                },
+
+                // [新代码ai生产] 复制下载链接到剪贴板
+                async copyDownloadUrl() {
+                    try {
+                        await navigator.clipboard.writeText(this.downloadInfo.downloadUrl);
+                        this.showMessage('下载链接已复制到剪贴板！', 'success');
+                    } catch (error) {
+                        console.error('复制失败:', error);
+                        // 降级方案：手动选择文本
+                        const urlInput = document.querySelector('.url-input');
+                        urlInput.select();
+                        document.execCommand('copy');
+                        this.showMessage('下载链接已复制到剪贴板！', 'success');
+                    }
+                },
+
+                // [新代码ai生产] 直接下载文件
+                downloadFile() {
+                    const link = document.createElement('a');
+                    link.href = this.downloadInfo.downloadUrl;
+                    link.download = this.downloadInfo.fileName;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                },
+
+                // [新代码ai生产] 显示消息提示
+                showMessage(message, type = 'info') {
+                    // 创建临时消息提示
+                    const messageDiv = document.createElement('div');
+                    messageDiv.className = `message ${type}`;
+                    messageDiv.textContent = message;
+                    messageDiv.style.cssText = `
+                        position: fixed;
+                        top: 20px;
+                        right: 20px;
+                        padding: 10px 20px;
+                        border-radius: 5px;
+                        color: white;
+                        font-weight: bold;
+                        z-index: 1000;
+                        animation: slideIn 0.3s ease;
+                    `;
+                    
+                    if (type === 'success') {
+                        messageDiv.style.backgroundColor = '#28a745';
+                    } else if (type === 'error') {
+                        messageDiv.style.backgroundColor = '#dc3545';
+                    } else {
+                        messageDiv.style.backgroundColor = '#17a2b8';
+                    }
+                    
+                    document.body.appendChild(messageDiv);
+                    
+                    setTimeout(() => {
+                        messageDiv.style.animation = 'slideOut 0.3s ease';
+                        setTimeout(() => {
+                            document.body.removeChild(messageDiv);
+                        }, 300);
+                    }, 2000);
+                },
+
+                // 开始上传
+                async startUpload() {
+                    if (!this.selectedFile) return;
+
+                    try {
+                        this.isUploading = true;
+                        this.downloadInfo = null; // [新代码ai生产] 重置下载信息
+                        this.uploadStatus = { type: 'uploading', message: '正在获取预签名URL...' };
+
+                        // 获取预签名URL
+                        const initResponse = await axios.post('http://localhost:3003/api/generate-upload-urls', {
+                            fileName: this.selectedFile.name,
+                            fileSize: this.selectedFile.size,
+                            chunkSize: this.chunkSize
+                        });
+
+                        this.uploadId = initResponse.data.uploadId;
+                        this.objectName = initResponse.data.objectName;
+                        this.presignedUrls = initResponse.data.presignedUrls;
+                        this.mergePresignedUrl = initResponse.data.mergePresignedUrl;
+                        this.totalChunks = initResponse.data.totalChunks;
+
+                        this.uploadStatus = { type: 'uploading', message: '开始上传分片...' };
+
+                        // 上传所有分片
+                        for (let i = 0; i < this.presignedUrls.length; i++) {
+                            const chunkInfo = this.presignedUrls[i];
+                            this.currentChunk = chunkInfo;
+                            this.currentChunkProgress = 0;
+
+                            try {
+                                const chunk = this.selectedFile.slice(chunkInfo.startByte, chunkInfo.endByte + 1);
+                                await this.uploadChunk(chunk, chunkInfo.url, chunkInfo.objectKey);
+                                
+                                this.uploadedChunksData.push({
+                                    partNumber: chunkInfo.partNumber,
+                                    objectKey: chunkInfo.objectKey,
+                                    size: chunk.size
+                                });
+                                
+                                this.uploadedChunks++;
+                                this.overallProgress = (this.uploadedChunks / this.totalChunks) * 100;
+                                
+                            } catch (error) {
+                                console.error(`分片 ${i + 1} 上传失败:`, error);
+                                this.uploadStatus = { type: 'error', message: `分片 ${i + 1} 上传失败` };
+                                return;
+                            }
+                        }
+
+                        this.uploadStatus = { type: 'uploading', message: '正在合并文件...' };
+
+                        // 客户端直接合并文件
+                        await this.mergeFile();
+
+                        this.uploadStatus = { type: 'success', message: '文件上传成功！' };
+
+                        // [新代码ai生产] 获取下载链接并显示
+                        try {
+                            const downloadUrl = await this.getDownloadUrl(this.objectName);
+                            this.downloadInfo = {
+                                fileName: this.selectedFile.name,
+                                fileSize: this.selectedFile.size,
+                                downloadUrl: downloadUrl
+                            };
+                            this.showMessage('文件上传成功！下载链接已生成。', 'success');
+                        } catch (error) {
+                            console.error('获取下载链接失败:', error);
+                            this.showMessage('文件上传成功，但获取下载链接失败。', 'error');
+                        }
+
+                    } catch (error) {
+                        console.error('上传失败:', error);
+                        this.uploadStatus = { type: 'error', message: '上传失败: ' + error.message };
+                    } finally {
+                        this.isUploading = false;
+                        this.currentChunk = null;
+                    }
+                },
+
+                // 上传单个分片
+                async uploadChunk(chunk, presignedUrl, objectKey) {
+                    return new Promise((resolve, reject) => {
+                        const xhr = new XMLHttpRequest();
+                        
+                        xhr.upload.addEventListener('progress', (event) => {
+                            if (event.lengthComputable) {
+                                this.currentChunkProgress = (event.loaded / event.total) * 100;
+                            }
+                        });
+
+                        xhr.addEventListener('load', () => {
+                            if (xhr.status >= 200 && xhr.status < 300) {
+                                resolve();
+                            } else {
+                                reject(new Error(`HTTP ${xhr.status}: ${xhr.statusText}`));
+                            }
+                        });
+
+                        xhr.addEventListener('error', () => {
+                            reject(new Error('网络错误'));
+                        });
+
+                        xhr.open('PUT', presignedUrl);
+                        xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+                        xhr.send(chunk);
+                    });
+                },
+
+                // 客户端直接合并文件 - 不经过服务器
+                async mergeFile() {
+                    try {
+                        // 读取所有分片数据
+                        const chunks = [];
+                        for (const chunkData of this.uploadedChunksData) {
+                            // 从MinIO获取分片数据
+                            const chunkResponse = await fetch(`http://103.119.2.223:9000/mybucket/${chunkData.objectKey}`);
+                            if (!chunkResponse.ok) {
+                                throw new Error(`获取分片 ${chunkData.partNumber} 失败`);
+                            }
+                            const chunkBlob = await chunkResponse.blob();
+                            chunks.push(chunkBlob);
+                        }
+
+                        // 合并所有分片
+                        const mergedBlob = new Blob(chunks, { type: 'application/octet-stream' });
+
+                        // 上传合并后的文件到MinIO
+                        const formData = new FormData();
+                        formData.append('file', mergedBlob, this.selectedFile.name);
+
+                        // 使用预签名URL上传合并后的文件
+                        const uploadResponse = await fetch(this.mergePresignedUrl, {
+                            method: 'PUT',
+                            body: mergedBlob,
+                            headers: {
+                                'Content-Type': 'application/octet-stream'
+                            }
+                        });
+
+                        if (!uploadResponse.ok) {
+                            throw new Error('合并文件上传失败');
+                        }
+
+                        // 清理分片文件（可选，这里简化处理）
+                        console.log('文件合并完成，分片文件将在后续清理');
+
+                    } catch (error) {
+                        console.error('合并文件失败:', error);
+                        throw error;
+                    }
+                },
+
+                // 格式化文件大小
+                formatFileSize(bytes) {
+                    if (bytes === 0) return '0 Bytes';
+                    const k = 1024;
+                    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+                    const i = Math.floor(Math.log(bytes) / Math.log(k));
+                    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+                }
+            }
+        });
+    </script>
+</body>
+
+<style>
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+    }
+
+    body {
+        font-family: 'Microsoft YaHei', sans-serif;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        min-height: 100vh;
+        padding: 8px; /* [新代码ai生产] 从12px缩小到8px */
+    }
+
+    .container {
+        max-width: 800px;
+        margin: 0 auto;
+        background: white;
+        border-radius: 12px; /* [新代码ai生产] 从15px缩小到12px */
+        box-shadow: 0 15px 30px rgba(0,0,0,0.1); /* [新代码ai生产] 从20px 40px缩小到15px 30px */
+        overflow: hidden;
+    }
+
+    .header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        padding: 15px; /* [新代码ai生产] 从20px缩小到15px */
+        text-align: center;
+    }
+
+    .header h1 {
+        font-size: 2.2em; /* [新代码ai生产] 从2.5em缩小到2.2em */
+        margin-bottom: 6px; /* [新代码ai生产] 从8px缩小到6px */
+    }
+
+    .content {
+        padding: 15px; /* [新代码ai生产] 从20px缩小到15px */
+    }
+
+    .upload-area {
+        border: 2px dashed #ddd; /* [新代码ai生产] 从3px缩小到2px */
+        border-radius: 8px; /* [新代码ai生产] 从10px缩小到8px */
+        padding: 18px; /* [新代码ai生产] 从25px缩小到18px */
+        text-align: center;
+        margin-bottom: 15px; /* [新代码ai生产] 从20px缩小到15px */
+        transition: all 0.3s ease;
+        cursor: pointer;
+    }
+
+    .upload-area:hover {
+        border-color: #667eea;
+        background-color: #f8f9ff;
+    }
+
+    .upload-area.dragover {
+        border-color: #667eea;
+        background-color: #f0f4ff;
+    }
+
+    .upload-icon {
+        font-size: 40px; /* [新代码ai生产] 从48px缩小到40px */
+        color: #667eea;
+        margin-bottom: 10px; /* [新代码ai生产] 从15px缩小到10px */
+    }
+
+    .file-input {
+        display: none;
+    }
+
+    .btn {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        padding: 6px 16px; /* [新代码ai生产] 从8px 20px缩小到6px 16px */
+        border-radius: 20px; /* [新代码ai生产] 从25px缩小到20px */
+        cursor: pointer;
+        font-size: 14px; /* [新代码ai生产] 从16px缩小到14px */
+        transition: all 0.3s ease;
+        margin: 4px; /* [新代码ai生产] 从6px缩小到4px */
+    }
+
+    .btn:hover {
+        transform: translateY(-1px); /* [新代码ai生产] 从-2px缩小到-1px */
+        box-shadow: 0 8px 16px rgba(102, 126, 234, 0.3); /* [新代码ai生产] 从10px 20px缩小到8px 16px */
+    }
+
+    .btn:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+        transform: none;
+    }
+
+    .progress-container {
+        margin: 12px 0; /* [新代码ai生产] 从15px缩小到12px */
+    }
+
+    .progress-bar {
+        width: 100%;
+        height: 16px; /* [新代码ai生产] 从20px缩小到16px */
+        background-color: #f0f0f0;
+        border-radius: 8px; /* [新代码ai生产] 从10px缩小到8px */
+        overflow: hidden;
+        margin: 6px 0; /* [新代码ai生产] 从8px缩小到6px */
+    }
+
+    .progress-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #667eea, #764ba2);
+        transition: width 0.3s ease;
+        border-radius: 8px; /* [新代码ai生产] 从10px缩小到8px */
+    }
+
+    .file-info {
+        background: #f8f9fa;
+        padding: 12px; /* [新代码ai生产] 从15px缩小到12px */
+        border-radius: 8px; /* [新代码ai生产] 从10px缩小到8px */
+        margin: 12px 0; /* [新代码ai生产] 从15px缩小到12px */
+    }
+
+    .chunk-progress {
+        margin: 6px 0; /* [新代码ai生产] 从8px缩小到6px */
+        padding: 6px; /* [新代码ai生产] 从8px缩小到6px */
+        background: #fff;
+        border-radius: 4px; /* [新代码ai生产] 从5px缩小到4px */
+        border-left: 3px solid #667eea; /* [新代码ai生产] 从4px缩小到3px */
+    }
+
+    .status {
+        padding: 3px 10px; /* [新代码ai生产] 从4px 12px缩小到3px 10px */
+        border-radius: 12px; /* [新代码ai生产] 从15px缩小到12px */
+        font-size: 11px; /* [新代码ai生产] 从12px缩小到11px */
+        font-weight: bold;
+    }
+
+    .status.success {
+        background: #d4edda;
+        color: #155724;
+    }
+
+    .status.error {
+        background: #f8d7da;
+        color: #721c24;
+    }
+
+    .status.uploading {
+        background: #fff3cd;
+        color: #856404;
+    }
+
+    /* [新代码ai生产] 下载信息样式 */
+    .download-info {
+        background: #e8f5e8;
+        padding: 12px; /* [新代码ai生产] 从15px缩小到12px */
+        border-radius: 8px; /* [新代码ai生产] 从10px缩小到8px */
+        margin: 12px 0; /* [新代码ai生产] 从15px缩小到12px */
+        border-left: 3px solid #28a745; /* [新代码ai生产] 从4px缩小到3px */
+    }
+
+    .download-item {
+        margin: 6px 0; /* [新代码ai生产] 从8px缩小到6px */
+    }
+
+    .download-url-container {
+        margin: 10px 0; /* [新代码ai生产] 从12px缩小到10px */
+    }
+
+    .url-display {
+        display: flex;
+        align-items: center;
+        gap: 8px; /* [新代码ai生产] 从10px缩小到8px */
+        margin: 6px 0; /* [新代码ai生产] 从8px缩小到6px */
+    }
+
+    .url-input {
+        flex: 1;
+        padding: 6px; /* [新代码ai生产] 从8px缩小到6px */
+        border: 1px solid #ddd;
+        border-radius: 4px; /* [新代码ai生产] 从5px缩小到4px */
+        font-family: monospace;
+        font-size: 11px; /* [新代码ai生产] 从12px缩小到11px */
+        background: #f8f9fa;
+        color: #333;
+    }
+
+    .copy-btn {
+        background: #17a2b8;
+        padding: 6px 10px; /* [新代码ai生产] 从8px 12px缩小到6px 10px */
+        font-size: 11px; /* [新代码ai生产] 从12px缩小到11px */
+        white-space: nowrap;
+    }
+
+    .download-actions {
+        display: flex;
+        gap: 8px; /* [新代码ai生产] 从10px缩小到8px */
+        margin-top: 10px; /* [新代码ai生产] 从12px缩小到10px */
+    }
+
+    .download-btn {
+        background: #28a745;
+    }
+
+    .open-btn {
+        background: #ffc107;
+        color: #212529;
+        text-decoration: none;
+        display: inline-block;
+    }
+
+    .open-btn:hover {
+        color: #212529;
+        text-decoration: none;
+    }
+
+    /* [新代码ai生产] 消息提示动画 */
+    @keyframes slideIn {
+        from {
+            transform: translateX(100%);
+            opacity: 0;
+        }
+        to {
+            transform: translateX(0);
+            opacity: 1;
+        }
+    }
+
+    @keyframes slideOut {
+        from {
+            transform: translateX(0);
+            opacity: 1;
+        }
+        to {
+            transform: translateX(100%);
+            opacity: 0;
+        }
+    }
+
+    .message {
+        box-shadow: 0 3px 10px rgba(0,0,0,0.15); /* [新代码ai生产] 从4px 12px缩小到3px 10px */
+    }
+</style>
+</html>
+
+
